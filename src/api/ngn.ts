@@ -50,6 +50,8 @@ import {
   type OrderRail,
 } from "../metrics";
 import { LinqError, getRate as getOfframpNgnPerUsd } from "../linq/client";
+import { rejectContractAddress } from "./address";
+import { parseAmount } from "./amount";
 import { sendError, sendLinqError } from "./errors";
 import { usdPerCoin } from "../linq/coinPrice";
 import {
@@ -597,39 +599,6 @@ const COINS: Record<string, OnrampCoin> = { xlm: "xlm", usdc: "usdc" };
 const ONRAMP_COINS: Record<string, OnrampCoin> = { xlm: "xlm" };
 const BILL_CATEGORIES: BillCategory[] = ["airtime", "data", "electricity", "cabletv", "betting"];
 
-/** A classic `G…` account, which is what Linq pays to and refunds to. */
-function isClassicAddress(value: unknown): value is string {
-  return typeof value === "string" && /^G[A-Z2-7]{55}$/.test(value);
-}
-
-/**
- * Both rails address the user by their **classic** account, never the smart
- * wallet contract.
- *
- * Linq pays by classic operation, and a classic payment cannot name a contract
- * as its destination — an exchange or a payroll tool paying a `C…` gets a
- * rejection. The receive screen made exactly this mistake once and the comment
- * there still records it. Getting it wrong on a refund is worse than on a
- * delivery: it fails at the moment the user has already paid and been told
- * their money is coming back.
- */
-function rejectContractAddress(res: Response, address: unknown, field: string): boolean {
-  if (typeof address === "string" && address.startsWith("C")) {
-    sendError(
-      res,
-      400,
-      "invalid_address",
-      `${field} must be the classic account, not the smart-wallet contract. Linq pays by classic operation, which cannot name a contract as its destination.`,
-    );
-    return true;
-  }
-  if (!isClassicAddress(address)) {
-    sendError(res, 400, "invalid_address", `${field} must be a valid Stellar account address`);
-    return true;
-  }
-  return false;
-}
-
 export function createNgnRouter(
   options: {
     lookupLimiter?: RateLimitRequestHandler;
@@ -825,6 +794,15 @@ export function createNgnRouter(
       sendError(res, 400, "invalid_request", "customerRef is required");
       return;
     }
+    // Before the rate is fetched, because that spends from a provider
+    // allowance every user shares and a request with no usable amount was
+    // always going to be refused. `Number("abc")` is NaN and `Number(true)`
+    // is 1; neither is an amount somebody meant to send.
+    const parsedAmountStableCoin = parseAmount(amountStableCoin);
+    if (parsedAmountStableCoin === null) {
+      sendError(res, 400, "invalid_request", "amountStableCoin must be a positive number");
+      return;
+    }
     // The crypto is delivered here, so it must be an address Linq can pay.
     if (rejectContractAddress(res, walletAddress, "walletAddress")) return;
 
@@ -848,7 +826,7 @@ export function createNgnRouter(
       res.setHeader("Cache-Control", "no-store");
       const order = await createOnrampOrder({
         customerRef,
-        amountStableCoin: Number(amountStableCoin),
+        amountStableCoin: parsedAmountStableCoin,
         walletAddress,
         rate: Number(rate),
         coin: resolvedCoin,
@@ -866,7 +844,7 @@ export function createNgnRouter(
         customerRef,
         walletAddress,
         coin: resolvedCoin,
-        amountStableCoin: order.amountStableCoin ?? Number(amountStableCoin),
+        amountStableCoin: order.amountStableCoin ?? parsedAmountStableCoin,
         amountNgn: order.amountNgn,
         rate: Number(rate),
         status: order.status,
@@ -938,6 +916,21 @@ export function createNgnRouter(
       return;
     }
 
+    // Both amounts are checked before `rejectMispricedRate` fetches a rate and
+    // before `payBill` is called: a missing or malformed amount would be
+    // refused either way, and the rate fetch spends from a provider allowance
+    // shared by every user.
+    const parsedAmountNgn = parseAmount(amountNgn);
+    if (parsedAmountNgn === null) {
+      sendError(res, 400, "invalid_request", "amountNgn must be a positive number");
+      return;
+    }
+    const parsedAmountStableCoin = parseAmount(amountStableCoin);
+    if (parsedAmountStableCoin === null) {
+      sendError(res, 400, "invalid_request", "amountStableCoin must be a positive number");
+      return;
+    }
+
     if (!BILL_CATEGORIES.includes(billCategory)) {
       sendError(res, 400, "invalid_request", `billCategory must be one of ${BILL_CATEGORIES.join(", ")}`);
       return;
@@ -965,8 +958,8 @@ export function createNgnRouter(
         billCategory,
         provider,
         customerId,
-        amountNgn: Number(amountNgn),
-        amountStableCoin: Number(amountStableCoin),
+        amountNgn: parsedAmountNgn,
+        amountStableCoin: parsedAmountStableCoin,
         rate: Number(rate),
         coin: resolvedCoin,
         refundAddress,
@@ -983,8 +976,8 @@ export function createNgnRouter(
         customerRef,
         walletAddress: refundAddress,
         coin: resolvedCoin,
-        amountStableCoin: Number(amountStableCoin),
-        amountNgn: Number(amountNgn),
+        amountStableCoin: parsedAmountStableCoin,
+        amountNgn: parsedAmountNgn,
         rate: Number(rate),
         status: order.status,
         billCategory,

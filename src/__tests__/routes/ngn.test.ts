@@ -348,6 +348,144 @@ describe("the server refuses a mispriced order", () => {
   });
 });
 
+// #462: a missing or malformed amount used to reach `rejectMispricedRate`
+// first, which spends a rate fetch from an allowance every user shares, and
+// then fell through to a `provider_rejected` code for a request the provider
+// was never asked. These are our refusals, so they carry `invalid_request` and
+// happen before either mock is touched.
+describe("amounts are checked before any rate fetch or provider call", () => {
+  beforeEach(() => {
+    (getOnrampRate as jest.Mock).mockResolvedValue(1450);
+    (usdPerCoin as jest.Mock).mockImplementation(async (c: string) =>
+      c === "usdc" ? 1 : 0.2,
+    );
+  });
+
+  const BAD_AMOUNTS: Array<[string, unknown]> = [
+    ["missing", undefined],
+    ["zero", 0],
+    ["a negative number", -1],
+    ["NaN", NaN],
+    ["Infinity", Infinity],
+    ["a non-numeric string", "abc"],
+    ["an empty string", ""],
+    ["a whitespace-only string", "   "],
+    ["a boolean", true],
+    ["an array", [5]],
+    ["an object", { value: 5 }],
+    ["an overflowing exponent string", "1e999"],
+  ];
+
+  // Plainly fake: no phone number, meter number or real account appears here.
+  const onrampOrder = (over: Record<string, unknown> = {}) => ({
+    customerRef: "ref_test_amount",
+    amountStableCoin: 1,
+    walletAddress: G_ADDRESS,
+    rate: 290,
+    coin: "xlm",
+    ...over,
+  });
+
+  const bill = (over: Record<string, unknown> = {}) => ({
+    customerRef: "ref_test_amount",
+    billCategory: "airtime",
+    provider: "MTN",
+    customerId: "0000000000",
+    amountNgn: 1000,
+    amountStableCoin: 0.75,
+    rate: 290,
+    coin: "xlm",
+    refundAddress: G_ADDRESS,
+    ...over,
+  });
+
+  function expectNoRateOrProviderCall(): void {
+    expect(getOnrampRate).not.toHaveBeenCalled();
+    expect(getSellRate).not.toHaveBeenCalled();
+    expect(usdPerCoin).not.toHaveBeenCalled();
+    expect(createOnrampOrder).not.toHaveBeenCalled();
+    expect(payBill).not.toHaveBeenCalled();
+  }
+
+  it.each(BAD_AMOUNTS)(
+    "refuses %s as amountStableCoin on an onramp order",
+    async (_label, value) => {
+      const res = await mainnet(
+        request(makeApp()).post("/ngn/onramp/orders").send(onrampOrder({ amountStableCoin: value })),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe("invalid_request");
+      expect(res.body.error).toMatch(/amountStableCoin/);
+      expectNoRateOrProviderCall();
+    },
+  );
+
+  it.each(BAD_AMOUNTS)("refuses %s as amountNgn on a bill", async (_label, value) => {
+    const res = await mainnet(
+      request(makeApp()).post("/ngn/bills").send(bill({ amountNgn: value })),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("invalid_request");
+    expect(res.body.error).toMatch(/amountNgn/);
+    expectNoRateOrProviderCall();
+  });
+
+  it.each(BAD_AMOUNTS)(
+    "refuses %s as amountStableCoin on a bill",
+    async (_label, value) => {
+      const res = await mainnet(
+        request(makeApp()).post("/ngn/bills").send(bill({ amountStableCoin: value })),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe("invalid_request");
+      expect(res.body.error).toMatch(/amountStableCoin/);
+      expectNoRateOrProviderCall();
+    },
+  );
+
+  it("accepts a plain decimal string on an onramp order", async () => {
+    (createOnrampOrder as jest.Mock).mockResolvedValue({
+      orderId: "o1",
+      amountNgn: 290,
+      status: "pending",
+    });
+
+    const res = await mainnet(
+      request(makeApp())
+        .post("/ngn/onramp/orders")
+        .send(onrampOrder({ amountStableCoin: "1.5" })),
+    );
+
+    expect(res.status).toBe(200);
+    expect(createOnrampOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ amountStableCoin: 1.5 }),
+    );
+  });
+
+  it("accepts plain decimal strings on a bill", async () => {
+    (payBill as jest.Mock).mockResolvedValue({
+      id: "b1",
+      customerRef: "ref_test_amount",
+      wallet: "GDXYZ",
+      status: "initiated",
+    });
+
+    const res = await mainnet(
+      request(makeApp())
+        .post("/ngn/bills")
+        .send(bill({ amountNgn: "1000", amountStableCoin: "0.75" })),
+    );
+
+    expect(res.status).toBe(200);
+    expect(payBill).toHaveBeenCalledWith(
+      expect.objectContaining({ amountNgn: 1000, amountStableCoin: 0.75 }),
+    );
+  });
+});
+
 describe("customer status", () => {
   it("answers from the reference alone, creating nothing", async () => {
     (getCustomerStatus as jest.Mock).mockResolvedValue({
